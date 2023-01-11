@@ -14,8 +14,8 @@ reviewers:
   - "@srm09"
   - "@yastij"
 creation-date: 2022-01-25
-last-updated: 2022-04-20
-status: provisional
+last-updated: 2023-01-11
+status: implemented
 ---
 
 # IP Address Management Integration
@@ -86,6 +86,8 @@ IP address management for machines is currently left to the infrastructure provi
 
 While DHCP is a viable solution for dynamic IP assignment which also enables scaling, it can cause problems in conjunction with CAPI. Especially in smaller networks rolling cluster upgrades can exhaust the network in use. When multiple machines are replaced in quick succession, each of them will get a new DHCP lease. Unless the lease time is very short, at least twice as many IPs as the maximum number of nodes has to be allocated to a cluster.
 
+Because this proposal removes dependence on DHCP, nameserver configuration is removed along with it. Nameservers should also be configurable along with IP addresses, paralleling DHCP conventions.
+
 Metal3 has an ip-address-manager component that allows for in-cluster management of IP addresses through custom resources, allowing to avoid DHCP. CAPV allows to ommit the address from the template while having DHCP disabled, and will wait until it is set manually, allowing to implement custom controllers to take care of IP assignments. At DTAG we've extended metal3's ip-address-manager and wrote a custom controller for CAPV to integrate both with Infoblox, our IPAM solution of choice. The CAPV project has shown interest, and there has been a proposal to allow integrating metal3's ip-address-manager with external systems.
 
 All on-premise providers have a need for IP Address Management, since they can't leverage SDN features that are available in clouds such as AWS, Azure or GCP. We therefore propose to add an API contract to CAPI, which allows infrastructure providers to integrate with different IPAM systems. A similar approach to Kubernetes' PersistentVolumes should be used where infrastructure providers create Claims that reference a specific IP Pool, and IPAM providers fulfill claims to Pools managed by them.
@@ -97,6 +99,7 @@ All on-premise providers have a need for IP Address Management, since they can't
     - allows to write IPAM providers to integrate with any IPAM solution
     - supports both IPv4 and IPv6
     - allows to run multiple IPAM providers in parallel
+    - allows configuration of nameservers along with IP addresses
 
 ### Non-Goals/Future Work
 
@@ -133,6 +136,11 @@ As an infrastructure provider I want a single interface to integrate with multip
 
 As an IPAM provider I want a single interface to integrate with all infrastructure providers that can benefit from IPAM integration.
 
+#### Story 5
+
+As a cluster operator I want to configure my IPAM Provider with nameservers
+that will automatically be used by any machine that claims ip
+addresses from my pool.
 
 ### IPAM API Contract
 
@@ -317,6 +325,9 @@ type IPAddressSpec struct {
  
   // Gateway is the network gateway of network the address is from.
   Gateway string `json:"gateway,omitempty"`
+
+  // Nameservers is the dns servers and search domains to be configured on the machine.
+  Nameservers IPAddressNameservers `json:"nameservers,omitempty"`
 }
  
 // IPAddress is a representation of an IP Address that was allocated from an IP Pool.
@@ -325,6 +336,31 @@ type IPAddress struct {
   metav1.ObjectMeta `json:"metadata,omitempty"`
 
   Spec IPAddressSpec `json:"spec,omitempty"`
+}
+```
+
+##### IPAddressNameservers
+
+`IPAddressNameservers` resources describe DNS and search domains configuration associated with the `IPAddress`.
+They are optionally configured on the IPAM provider fulfilling the `IPAddressClaim`.
+
+The nameservers fields will accept addresses and search domains similar to what
+[netplan](https://netplan.io/reference#common-properties-for-all-device-types)
+or
+[cloud-init](https://cloudinit.readthedocs.io/en/latest/reference/network-config-format-v2.html#nameservers-mapping)
+do already.
+
+Existing IPAM Providers can choose to configure and supply nameservers to the
+IPAddress resource when allocated, but do not have to.
+
+```go
+// IPAddressNameservers is the dns servers and search domains.
+type IPAddressNameservers struct {
+  // Search are the set of search domains to be configured on the machine.
+  Search []string `json:"search,omitempty"`
+
+  // Addresses are the set of dns servers that should be used for dns queries.
+  Addresses []string `json:"addresses"`
 }
 ```
 
@@ -374,6 +410,133 @@ See the following picture for a sequence diagram of the allocation process.
 
 ![sequence diagram of the consumption process](./images/ipam-integration/sequence.png)
 
+#### Nameservers Ordering and Precedence
+
+When there are multiple `IPAddresses` each with different `Nameservers` fields, the nameservers shall
+be ordered and merged according to the order that `IPAddresses` are assigned to the machine.
+
+Using CAPV as an example, if a machine specifies IP pool references like so:
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: VSphereMachineTemplate
+metadata:
+  name: example
+  namespace: vsphere-site1
+spec:
+  template:
+    spec:
+      cloneMode: FullClone
+      numCPUs: 8
+      memoryMiB: 8192
+      diskGiB: 45
+      network:
+        devices:
+        # Device 0 has one address from testpool-1
+        - dhcp4: false
+          addressesFromPools:
+          - group: ipam.cluster.x-k8s.io/v1alpha1
+            kind: IPPool
+            name: testpool-1
+        # Device 1 has one address from testpool-2
+        - dhcp4: false
+          addressesFromPools:
+          - group: ipam.cluster.x-k8s.io/v1alpha1
+            kind: IPPool
+            name: testpool-2
+        # Device 2 has two addresses from testpool-3 and testpool-4
+        - dhcp4: false
+          addressesFromPools:
+          - group: ipam.cluster.x-k8s.io/v1alpha1
+            kind: IPPool
+            name: testpool-3
+          addressesFromPools:
+          - group: ipam.cluster.x-k8s.io/v1alpha1
+            kind: IPPool
+            name: testpool-4
+```
+
+and supposing that `IPAddressClaims` for each of these three pools were generated and yielded
+`IPAddresses` in the following order:
+```yaml
+---
+# The first IPAddress has no nameservers provided
+apiVersion: ipam.cluster.x-k8s.io/v1alpha1
+kind: IPAddress
+metadata:
+  name: example-0-0
+  namespace: vsphere-site1
+spec:
+  address: "10.0.0.10"
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: IPPool
+    name: test-pool-1
+
+---
+apiVersion: ipam.cluster.x-k8s.io/v1alpha1
+kind: IPAddress
+metadata:
+  name: example-1-0
+  namespace: vsphere-site1
+spec:
+  address: "10.0.1.10"
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: IPPool
+    name: test-pool-2
+  nameservers:
+    search: ["corp.domain"]
+    addresses: ["10.0.0.1"]
+
+---
+apiVersion: ipam.cluster.x-k8s.io/v1alpha1
+kind: IPAddress
+metadata:
+  name: example-2-0
+  namespace: vsphere-site1
+spec:
+  address: "10.0.2.10"
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: IPPool
+    name: test-pool-3
+  nameservers:
+    search: ["alternate.domain"]
+    addresses: ["10.100.0.1"]
+
+---
+apiVersion: ipam.cluster.x-k8s.io/v1alpha1
+kind: IPAddress
+metadata:
+  name: example-2-1
+  namespace: vsphere-site1
+spec:
+  address: "10.0.3.10"
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: IPPool
+    name: test-pool-4
+  nameservers:
+    search: ["yet.another.domain"]
+    addresses: ["10.200.0.1"]
+
+```
+
+then the resulting `nameservers` configuration on the machine will be the following
+```yaml
+nameservers:
+  search: ["corp.domain", "alternate.domain", "yet.another.domain"]
+  addresses: ["10.0.0.1", "10.100.0.1", "10.200.0.1"]
+
+```
+
+Additionally, any nameserver settings on the Machine should take precedence
+over nameservers provided by `IPAddresses`.
+
+The behavior when `IPAddress.spec.nameservers` are provided and DHCP is enabled
+and providing nameservers is undefined.
+
 #### Additional Notes
 
 - An example provider that provides in-cluster IP Address management (also useful for testing, or when no other IPAM solution is available) should be implemented as a separate project in a separate repository.
@@ -392,6 +555,11 @@ See the following picture for a sequence diagram of the allocation process.
 
 - Unresponsive IPAM providers can prevent successful creation of a cluster
 - Wrong IP address allocations (e.g. duplicates) can brick a cluster’s network
+- Nameservers shouldn't add any risk over what can already be done via DHCP or
+  setting nameservers directly on the machine. The nameserver ordering and
+  precedence rules should also mitigate any potential issues with "breaking"
+  changes since explicitly setting the nameservers on the machine takes
+  precedence over nameservers from the IPAM API.
 
 ## Alternatives
 
@@ -402,3 +570,4 @@ As an alternative to an official API contract, all interested providers could ag
 - [x] 07/01/2021: Compile a Google Doc following the CAEP template (link here)
 - [x] 08/18/2021: Present proposal at CAPI office hours
 - [x] 01/26/2022: Open proposal PR
+- [x] 01/11/2023: Add nameservers field to IPAddress
